@@ -156,6 +156,7 @@ async function writeDirectTelegramTranscriptContext(params: {
   sessionId: string;
   text: string;
   timestamp: number;
+  role?: "assistant" | "user";
 }) {
   const route = resolveTelegramConversationRoute({
     cfg: params.cfg,
@@ -187,10 +188,10 @@ async function writeDirectTelegramTranscriptContext(params: {
     [
       JSON.stringify({ type: "session", id: params.sessionId }),
       JSON.stringify({
-        id: "transcript-user-1",
+        id: `transcript-${params.role ?? "user"}-1`,
         type: "message",
         message: {
-          role: "user",
+          role: params.role ?? "user",
           content: params.text,
           timestamp: params.timestamp,
         },
@@ -2167,6 +2168,99 @@ describe("createTelegramBot", () => {
       expect(photoMessage?.media_ref).toBe("telegram:file/reference-photo-1");
     } finally {
       await rm(storePath, { force: true });
+    }
+  });
+
+  it("prefers Telegram cache over duplicate assistant transcript context", async () => {
+    onSpy.mockClear();
+    replySpy.mockClear();
+
+    const sessionId = "telegram-dm-duplicate-assistant-session";
+    const storePath = `/tmp/openclaw-telegram-dm-duplicate-assistant-${process.pid}-${Date.now()}.json`;
+    const sessionPath = path.join(path.dirname(storePath), `${sessionId}.jsonl`);
+    const config = {
+      channels: {
+        telegram: {
+          dmPolicy: "open",
+          allowFrom: ["*"],
+        },
+      },
+      session: {
+        store: storePath,
+      },
+    } satisfies NonNullable<Parameters<typeof createTelegramBot>[0]["config"]>;
+
+    await rm(storePath, { force: true });
+    await rm(sessionPath, { force: true });
+    try {
+      loadConfig.mockReturnValue(config);
+      createTelegramBot({ token: "tok", config });
+      const handler = getOnHandler("message") as (ctx: Record<string, unknown>) => Promise<void>;
+      const baseCtx = {
+        me: { id: 999, username: "openclaw_bot" },
+        getFile: async () => ({ download: async () => new Uint8Array() }),
+      };
+
+      await handler({
+        ...baseCtx,
+        message: {
+          chat: { id: 7773, type: "private" },
+          text: "I already handled it.",
+          date: 1778474805,
+          message_id: 200,
+          from: { id: 998, is_bot: true, first_name: "OpenClaw" },
+        },
+      });
+
+      await writeDirectTelegramTranscriptContext({
+        cfg: config,
+        storePath,
+        chatId: 7773,
+        senderId: 202,
+        sessionId,
+        role: "assistant",
+        text: "[[reply_to_current]]I already handled it.",
+        timestamp: 1778474800000,
+      });
+
+      replySpy.mockClear();
+      await handler({
+        ...baseCtx,
+        message: {
+          chat: { id: 7773, type: "private" },
+          text: "what did you just say?",
+          date: 1778474850,
+          message_id: 201,
+          from: { id: 202, is_bot: false, first_name: "Kesava" },
+        },
+      });
+
+      expect(replySpy).toHaveBeenCalledTimes(1);
+      const payload = mockMsgContextArg(
+        replySpy as unknown as MockCallSource,
+        0,
+        0,
+        "replySpy call",
+      );
+      const [conversationContext] = requireArray(
+        payload.UntrustedStructuredContext,
+        "structured context",
+      );
+      const contextRecord = requireRecord(conversationContext, "conversation context");
+      const contextPayload = requireRecord(contextRecord.payload, "conversation context payload");
+      const messages = requireArray(contextPayload.messages, "conversation context messages").map(
+        (message, index) => requireRecord(message, `conversation context message ${index + 1}`),
+      );
+      const duplicateAssistantMessages = messages.filter((message) =>
+        String(message.body ?? "").includes("I already handled it."),
+      );
+      expect(duplicateAssistantMessages).toHaveLength(1);
+      expect(duplicateAssistantMessages[0]?.message_id).toBe("200");
+      expect(duplicateAssistantMessages[0]?.body).toBe("I already handled it.");
+      expect(JSON.stringify(messages)).not.toContain("[[reply_to_current]]");
+    } finally {
+      await rm(storePath, { force: true });
+      await rm(sessionPath, { force: true });
     }
   });
 

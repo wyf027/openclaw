@@ -173,10 +173,13 @@ import { buildTelegramSessionTranscriptPromptMessages } from "./session-transcri
 
 type TelegramPromptContextMessageForDedupe = {
   body?: unknown;
+  sender?: unknown;
   timestamp_ms?: unknown;
 };
 
-function resolvePromptContextTextDedupeKey(
+const PROMPT_CONTEXT_DIRECTIVE_TAG_PREFIX_RE = /^\s*(?:\[\[[^\]\r\n]+\]\]\s*)+/;
+
+function resolvePromptContextExactTextDedupeKey(
   message: TelegramPromptContextMessageForDedupe,
 ): string | undefined {
   if (typeof message.body !== "string" || !message.body.trim()) {
@@ -186,6 +189,36 @@ function resolvePromptContextTextDedupeKey(
     return undefined;
   }
   return `${message.timestamp_ms}:${message.body.trim()}`;
+}
+
+function resolvePromptContextVisibleTextDedupeKey(
+  message: TelegramPromptContextMessageForDedupe,
+): string | undefined {
+  if (typeof message.body !== "string") {
+    return undefined;
+  }
+  if (typeof message.sender !== "string") {
+    return undefined;
+  }
+  const sender = message.sender
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const body = message.body
+    .replace(PROMPT_CONTEXT_DIRECTIVE_TAG_PREFIX_RE, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return sender && body ? `visible:${sender}:${body}` : undefined;
+}
+
+function resolvePromptContextTextDedupeKeys(
+  message: TelegramPromptContextMessageForDedupe,
+): string[] {
+  return [
+    resolvePromptContextExactTextDedupeKey(message),
+    resolvePromptContextVisibleTextDedupeKey(message),
+  ].filter((key): key is string => key !== undefined);
 }
 
 export const registerTelegramHandlers = ({
@@ -1328,13 +1361,11 @@ export const registerTelegramHandlers = ({
       ),
     );
     const cacheTextKeys = new Set(
-      cachePromptMessages
-        .map((message) => resolvePromptContextTextDedupeKey(message))
-        .filter((key) => key !== undefined),
+      cachePromptMessages.flatMap((message) => resolvePromptContextTextDedupeKeys(message)),
     );
     const sessionOnlyPromptMessages = sessionPromptMessages.filter((message) => {
-      const key = resolvePromptContextTextDedupeKey(message);
-      return key === undefined || !cacheTextKeys.has(key);
+      const keys = resolvePromptContextTextDedupeKeys(message);
+      return keys.length === 0 || keys.every((key) => !cacheTextKeys.has(key));
     });
     const promptMessages = [...sessionOnlyPromptMessages, ...cachePromptMessages].toSorted(
       (left, right) => (left.timestamp_ms ?? 0) - (right.timestamp_ms ?? 0),
