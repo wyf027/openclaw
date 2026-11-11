@@ -1,0 +1,39 @@
+name: Verify OpenClaw PR 197148 build
+on:
+  push:
+    branches:
+      - verify/pr-197148-package-1d6eb7a4
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGET_SHA: 1d6eb7a4e251e578e695818633e9547ef6764712
+    steps:
+      - name: Check out the exact PR commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 1d6eb7a4e251e578e695818633e9547ef6764712
+          persist-credentials: false
+      - name: Verify the checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git show -s --format='%H %s' HEAD
+      - name: Set up Node and frozen dependencies
+        uses: ./.github/actions/setup-node-env
+        with:
+          cache-mode: off
+      - name: Build dist
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm build:ci-artifacts
+      - name: Smoke-test the built CLI
+        run: node openclaw.mjs --version
+      - name: Typecheck the core
+        run: pnpm tsgo:core
+      - name: Run the diagnostic regression tests
+        run: pnpm test src/cli/failure-output.contention.test.ts --maxWorkers=1
