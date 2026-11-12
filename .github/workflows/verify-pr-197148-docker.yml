@@ -1,0 +1,128 @@
+name: Verify OpenClaw PR 197148 in Docker
+on:
+  push:
+    branches:
+      - verify/pr-197148-docker-1d6eb7a4
+
+permissions:
+  contents: read
+
+jobs:
+  docker-verification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGET_SHA: 1d6eb7a4e251e578e695818633e9547ef6764712
+      PROOF_IMAGE: openclaw-pr197148:verify
+    steps:
+      - name: Check out the exact PR commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 1d6eb7a4e251e578e695818633e9547ef6764712
+          persist-credentials: false
+      - name: Build the repository Docker image
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git show -s --format='%H %s' HEAD
+          docker buildx build --load --platform linux/amd64 --progress plain \
+            --target openclaw-runtime \
+            --build-arg "GIT_COMMIT=$TARGET_SHA" \
+            --build-arg OPENCLAW_EXTENSIONS=matrix \
+            --tag "$PROOF_IMAGE" .
+          docker run --rm --network none "$PROOF_IMAGE" node openclaw.mjs --version \
+            | tee "$RUNNER_TEMP/openclaw-docker-version.txt"
+          grep -Fq '(1d6eb7a)' "$RUNNER_TEMP/openclaw-docker-version.txt"
+      - name: Verify Gateway ownership diagnostics and clean stop
+        run: |
+          set -Eeuo pipefail
+          volume="openclaw-pr197148-$GITHUB_RUN_ID"
+          gateway="openclaw-pr197148-gw-$GITHUB_RUN_ID"
+          logdir="$(mktemp -d "$RUNNER_TEMP/openclaw-docker-proof.XXXXXX")"
+          cleanup() {
+            docker rm -f "$gateway" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+          mounted=(--network none --volume "$volume:/home/node/.openclaw" -e OPENCLAW_DISABLE_BONJOUR=1
+            -e OPENCLAW_STATE_DIR=/home/node/.openclaw
+            -e OPENCLAW_CONFIG_PATH=/home/node/.openclaw/openclaw.json)
+          docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e '
+            const fs = require("node:fs");
+            const config = {
+              gateway: {
+                mode: "local", bind: "loopback", port: 18789,
+                auth: {mode: "token"}, controlUi: {enabled: false}
+              },
+              plugins: {entries: {matrix: {enabled: true}}}
+            };
+            fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify(config), {mode: 0o600});
+          '
+          docker run -d --name "$gateway" "${mounted[@]}" "$PROOF_IMAGE" \
+            node openclaw.mjs gateway --bind loopback --port 18789 >/dev/null
+
+          gateway_ready() {
+            docker exec "$gateway" curl -fsS http://127.0.0.1:18789/startupz >/dev/null 2>&1
+          }
+          for attempt in $(seq 1 60); do
+            if gateway_ready; then break; fi
+            sleep 2
+          done
+          if ! gateway_ready; then
+            docker logs "$gateway" 2>&1 | grep -Eiv 'token|secret|credential|password' | tail -25 || true
+            exit 1
+          fi
+
+          owner_script='
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const {createHash} = require("node:crypto");
+            const owners = [];
+            function scan(dir) {
+              if (!fs.existsSync(dir)) return;
+              for (const item of fs.readdirSync(dir, {withFileTypes: true})) {
+                const file = path.join(dir, item.name);
+                if (item.isDirectory()) scan(file);
+                else if (/^state\..+\.lock$/.test(item.name)) {
+                  const data = fs.readFileSync(file);
+                  if (JSON.parse(data).role === "gateway") owners.push(data);
+                }
+              }
+            }
+            scan("/home/node/.openclaw/tmp");
+            if (owners.length > 1) throw new Error("Multiple Gateway owner records");
+            console.log(owners.length ? createHash("sha256").update(owners[0]).digest("hex") : "none");
+          '
+          before="$(docker exec "$gateway" node -e "$owner_script")"
+          [[ "$before" =~ ^[0-9a-f]{64}$ ]]
+          docker run --rm --pid "container:$gateway" "${mounted[@]}" "$PROOF_IMAGE" \
+            node openclaw.mjs status --timeout 1000 >"$logdir/shared.txt" 2>&1
+          echo "Shared PID namespace status: exit 0"
+
+          isolated_exit=0
+          docker run --rm "${mounted[@]}" "$PROOF_IMAGE" \
+            node openclaw.mjs status --timeout 1000 >"$logdir/isolated.txt" 2>&1 || isolated_exit=$?
+          echo "Independent PID namespace status: exit $isolated_exit"
+          test "$isolated_exit" = 1
+          grep -Fq 'cannot verify Gateway ownership' "$logdir/isolated.txt"
+          grep -Fq 'shared PID namespace' "$logdir/isolated.txt"
+          echo "Default refusal includes the ownership reason and shared PID namespace guidance"
+
+          after="$(docker exec "$gateway" node -e "$owner_script")"
+          test "$before" = "$after"
+          gateway_ready
+          echo "Gateway owner SHA-256 before and after: $after"
+          echo "Gateway startup endpoint remained healthy"
+
+          docker stop --time 30 "$gateway" >/dev/null
+          echo "Gateway container exit after normal Docker stop: $(docker inspect --format '{{.State.ExitCode}}' "$gateway")"
+          after_stop="$(docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e "$owner_script")"
+          test "$after_stop" = none
+          echo "Gateway owner record after normal Docker stop: absent"
+          docker run --rm "${mounted[@]}" "$PROOF_IMAGE" \
+            node openclaw.mjs status --timeout 1000 >"$logdir/stopped.txt" 2>&1
+          echo "One-off status after normal Docker stop: exit 0"
+          docker run --rm "${mounted[@]}" "$PROOF_IMAGE" \
+            node openclaw.mjs matrix doctor inspect >"$logdir/matrix.txt" 2>&1
+          grep -Fq 'No blocked Matrix crypto stores found' "$logdir/matrix.txt"
+          echo "Read-only Matrix doctor inspect after stop: exit 0, no blocked stores"
