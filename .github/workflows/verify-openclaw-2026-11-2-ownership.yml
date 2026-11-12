@@ -1,0 +1,134 @@
+name: Compare OpenClaw 2026.11.2 Docker ownership
+on:
+  push:
+    branches:
+      - verify/issue-196846-release-2026-11-2
+
+permissions:
+  contents: read
+
+jobs:
+  released-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      PROOF_IMAGE: ghcr.io/openclaw/openclaw@sha256:c764f17ed94b725599043f0548ece6297f1fe4409e6dd1133b1d2fb1f8d2b599
+    steps:
+      - name: Pull and identify the pinned Linux amd64 release
+        run: |
+          docker pull --platform linux/amd64 "$PROOF_IMAGE"
+          docker run --rm --network none --user 1000:1000 --entrypoint openclaw "$PROOF_IMAGE" --version \
+            | tee "$RUNNER_TEMP/openclaw-released-version.txt"
+          grep -Fq '2026.11.2' "$RUNNER_TEMP/openclaw-released-version.txt"
+      - name: Compare live ownership and observe normal Docker stop
+        run: |
+          set -Eeuo pipefail
+          state="$(mktemp -d "$RUNNER_TEMP/openclaw-release-state.XXXXXX")"
+          logs="$(mktemp -d "$RUNNER_TEMP/openclaw-release-proof.XXXXXX")"
+          gateway="openclaw-release-proof-$GITHUB_RUN_ID"
+          trap 'docker rm -f "$gateway" >/dev/null 2>&1 || true' EXIT
+
+          sudo chown 1000:1000 "$state"
+          mounted=(--network none --user 1000:1000 --volume "$state:/home/node/.openclaw"
+            -e OPENCLAW_DISABLE_BONJOUR=1
+            -e OPENCLAW_STATE_DIR=/home/node/.openclaw
+            -e OPENCLAW_CONFIG_PATH=/home/node/.openclaw/openclaw.json)
+          docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync("/home/node/.openclaw/openclaw.json", JSON.stringify({
+              gateway: {
+                mode: "local", bind: "loopback", port: 18789,
+                auth: {mode: "token"}, controlUi: {enabled: false}
+              }
+            }), {mode: 0o600});
+          '
+          docker run -d --name "$gateway" "${mounted[@]}" "$PROOF_IMAGE" \
+            node openclaw.mjs gateway --bind loopback --port 18789 >/dev/null
+
+          gateway_ready() {
+            docker exec "$gateway" curl -fsS http://127.0.0.1:18789/startupz >/dev/null 2>&1
+          }
+          for attempt in $(seq 1 60); do
+            if gateway_ready; then break; fi
+            sleep 2
+          done
+          if ! gateway_ready; then
+            docker logs "$gateway" 2>&1 | grep -Eiv 'token|secret|credential|password' | tail -18 || true
+            exit 1
+          fi
+          echo "Release Gateway is healthy"
+
+          owner_reader='
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const {createHash} = require("node:crypto");
+            const records = [];
+            function scan(dir) {
+              if (!fs.existsSync(dir)) return;
+              for (const item of fs.readdirSync(dir, {withFileTypes: true})) {
+                const file = path.join(dir, item.name);
+                if (item.isDirectory()) scan(file);
+                else if (/^state\..+\.lock$/.test(item.name)) {
+                  const bytes = fs.readFileSync(file);
+                  if (JSON.parse(bytes).role === "gateway") {
+                    const hash = createHash("sha256").update(bytes).digest("hex");
+                    records.push({hash, mtimeMs: fs.statSync(file).mtimeMs});
+                  }
+                }
+              }
+            }
+            scan("/home/node/.openclaw/tmp");
+            if (records.length > 1) throw new Error("Multiple Gateway owner records");
+            console.log(records.length ? JSON.stringify(records[0]) : "absent");
+          '
+          live_owner="$(docker exec "$gateway" node -e "$owner_reader")"
+          echo "Release live Gateway owner: $live_owner"
+          test "$live_owner" != absent
+
+          inside=0
+          docker exec "$gateway" openclaw status --timeout 1000 >"$logs/inside.txt" 2>&1 || inside=$?
+          echo "Release status inside Gateway container: exit $inside"
+          if [ "$inside" -ne 0 ]; then
+            grep -Eiv 'token|secret|credential|password' "$logs/inside.txt" | tail -15 || true
+            exit 1
+          fi
+
+          separate=0
+          docker run --rm "${mounted[@]}" --entrypoint openclaw "$PROOF_IMAGE" \
+            status --timeout 1000 >"$logs/separate.txt" 2>&1 || separate=$?
+          echo "Release default status from separate container with live Gateway: exit $separate"
+          if grep -Fq 'cannot verify Gateway ownership' "$logs/separate.txt"; then
+            echo "Release default output includes the ownership reason: yes"
+          else
+            echo "Release default output includes the ownership reason: no"
+          fi
+
+          debug=0
+          docker run --rm "${mounted[@]}" -e OPENCLAW_DEBUG=1 --entrypoint openclaw "$PROOF_IMAGE" \
+            status --timeout 1000 >"$logs/debug.txt" 2>&1 || debug=$?
+          echo "Release debug status from separate container with live Gateway: exit $debug"
+          if grep -Eq 'GatewayLockNamespaceError|cannot verify Gateway ownership' "$logs/debug.txt"; then
+            echo "Release debug output identifies the ownership refusal: yes"
+          else
+            echo "Release debug output identifies the ownership refusal: no"
+          fi
+          gateway_ready
+          docker stop --time 30 "$gateway" >/dev/null
+          echo "Release Gateway container exit after normal stop: $(docker inspect --format '{{.State.ExitCode}}' "$gateway")"
+          after_stop="$(docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e "$owner_reader")"
+          echo "Release owner immediately after normal stop: $after_stop"
+
+          sleep 48
+          after_48="$(docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e "$owner_reader")"
+          echo "Release owner after at least 48 seconds: $after_48"
+          sleep 48
+          after_96="$(docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e "$owner_reader")"
+          echo "Release owner after at least 96 seconds: $after_96"
+
+          stopped=0
+          docker run --rm "${mounted[@]}" --entrypoint openclaw "$PROOF_IMAGE" \
+            status --timeout 1000 >"$logs/stopped.txt" 2>&1 || stopped=$?
+          echo "Release one-off status after at least 96 seconds: exit $stopped"
+          if [ "$stopped" -ne 0 ]; then
+            grep -Eiv 'token|secret|credential|password' "$logs/stopped.txt" | tail -15 || true
+          fi
