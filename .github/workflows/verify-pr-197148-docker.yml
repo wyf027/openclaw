@@ -73,6 +73,7 @@ jobs:
             exit 1
           fi
 
+          echo "Gateway startup endpoint is healthy"
           owner_script='
             const fs = require("node:fs");
             const path = require("node:path");
@@ -94,18 +95,30 @@ jobs:
             console.log(owners.length ? createHash("sha256").update(owners[0]).digest("hex") : "none");
           '
           before="$(docker exec "$gateway" node -e "$owner_script")"
-          [[ "$before" =~ ^[0-9a-f]{64}$ ]]
-          docker run --rm --pid "container:$gateway" "${mounted[@]}" "$PROOF_IMAGE" \
-            node openclaw.mjs status --timeout 1000 >"$logdir/shared.txt" 2>&1
-          echo "Shared PID namespace status: exit 0"
+          if ! [[ "$before" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::No Gateway owner record was found after startup"
+            exit 1
+          fi
+          echo "Gateway emitted its owner record"
+          report_failure() {
+            grep -Eiv 'token|secret|credential|password' "$1" | tail -15 || true
+          }
+          shared_exit=0
+          docker exec "$gateway" node openclaw.mjs status --timeout 1000 \
+            >"$logdir/shared.txt" 2>&1 || shared_exit=$?
+          echo "Inside Gateway container status: exit $shared_exit"
+          if [ "$shared_exit" -ne 0 ]; then report_failure "$logdir/shared.txt"; exit 1; fi
 
           isolated_exit=0
           docker run --rm "${mounted[@]}" "$PROOF_IMAGE" \
             node openclaw.mjs status --timeout 1000 >"$logdir/isolated.txt" 2>&1 || isolated_exit=$?
           echo "Independent PID namespace status: exit $isolated_exit"
-          test "$isolated_exit" = 1
-          grep -Fq 'cannot verify Gateway ownership' "$logdir/isolated.txt"
-          grep -Fq 'shared PID namespace' "$logdir/isolated.txt"
+          if [ "$isolated_exit" -ne 1 ] \
+            || ! grep -Fq 'cannot verify Gateway ownership' "$logdir/isolated.txt" \
+            || ! grep -Fq 'shared PID namespace' "$logdir/isolated.txt"; then
+            report_failure "$logdir/isolated.txt"
+            exit 1
+          fi
           echo "Default refusal includes the ownership reason and shared PID namespace guidance"
 
           after="$(docker exec "$gateway" node -e "$owner_script")"
@@ -117,12 +130,18 @@ jobs:
           docker stop --time 30 "$gateway" >/dev/null
           echo "Gateway container exit after normal Docker stop: $(docker inspect --format '{{.State.ExitCode}}' "$gateway")"
           after_stop="$(docker run --rm "${mounted[@]}" "$PROOF_IMAGE" node -e "$owner_script")"
-          test "$after_stop" = none
+          if [ "$after_stop" != none ]; then
+            echo "::error::Gateway owner record is still present after normal Docker stop"
+            exit 1
+          fi
           echo "Gateway owner record after normal Docker stop: absent"
           docker run --rm "${mounted[@]}" "$PROOF_IMAGE" \
-            node openclaw.mjs status --timeout 1000 >"$logdir/stopped.txt" 2>&1
+            node openclaw.mjs status --timeout 1000 >"$logdir/stopped.txt" 2>&1 \
+            || { report_failure "$logdir/stopped.txt"; exit 1; }
           echo "One-off status after normal Docker stop: exit 0"
           docker run --rm "${mounted[@]}" "$PROOF_IMAGE" \
-            node openclaw.mjs matrix doctor inspect >"$logdir/matrix.txt" 2>&1
-          grep -Fq 'No blocked Matrix crypto stores found' "$logdir/matrix.txt"
+            node openclaw.mjs matrix doctor inspect >"$logdir/matrix.txt" 2>&1 \
+            || { report_failure "$logdir/matrix.txt"; exit 1; }
+          grep -Fq 'No blocked Matrix crypto stores found' "$logdir/matrix.txt" \
+            || { report_failure "$logdir/matrix.txt"; exit 1; }
           echo "Read-only Matrix doctor inspect after stop: exit 0, no blocked stores"
