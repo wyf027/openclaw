@@ -1,0 +1,156 @@
+name: Verify OpenClaw 197146 Compose pairing and persistence
+on:
+  push:
+    branches:
+      - verify/pr-197146-compose-32a63a4
+
+permissions:
+  contents: read
+
+jobs:
+  compose-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PROOF_IMAGE: ghcr.io/openclaw/openclaw@sha256:c764f17ed94b725599043f0548ece6297f1fe4409e6dd1133b1d2fb1f8d2b599
+      COMPOSE_PROJECT_NAME: openclaw-compose-proof
+    steps:
+      - name: Run the documented Compose services on Linux
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          work="$(mktemp -d "$RUNNER_TEMP/openclaw-compose.XXXXXX")"
+          cd "$work"
+          trap 'docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true' EXIT
+          unset OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_PASSWORD OPENCLAW_IMAGE
+          docker compose version
+          curl -fsSL https://raw.githubusercontent.com/openclaw/openclaw/v2026.11.2/docker-compose.yml -o compose.yaml
+          printf 'OPENCLAW_IMAGE=%s\n' "$PROOF_IMAGE" > .env
+          cat > compose.override.yaml <<'YAML'
+          services:
+            openclaw-gateway:
+              build: !reset null
+              ports: !override
+                - "127.0.0.1:18789:18789"
+              volumes: !override
+                - openclaw-state:/home/node/.openclaw
+                - openclaw-auth:/home/node/.config/openclaw
+            openclaw-cli:
+              volumes: !override
+                - openclaw-state:/home/node/.openclaw
+                - openclaw-auth:/home/node/.config/openclaw
+          
+          volumes:
+            openclaw-state:
+            openclaw-auth:
+          YAML
+
+          docker compose config --format json > compose.json
+          node -e '
+            const a = require("./compose.json").services;
+            const [p] = a["openclaw-gateway"].ports;
+            if (a["openclaw-gateway"].ports.length !== 1 || p.host_ip !== "127.0.0.1" || String(p.published) !== "18789") {
+              throw new Error("Unexpected port publication");
+            }
+            if (a["openclaw-gateway"].build) throw new Error("Unexpected source build");
+          '
+          docker compose pull
+          docker run --rm --network none "$PROOF_IMAGE" node openclaw.mjs --version \
+            | tee version.txt
+          grep -Fq '2026.11.2 (b556fdf)' version.txt
+          npm install --no-audit --no-fund --ignore-scripts playwright@1.63.0
+          ./node_modules/.bin/playwright install chromium
+
+          if ! docker compose run --rm -T --no-deps --entrypoint node openclaw-gateway openclaw.mjs onboard \
+            --mode local --flow advanced --gateway-bind lan --gateway-auth token \
+            --skip-health --no-install-daemon --non-interactive --accept-risk \
+            --auth-choice skip --gateway-port 18789 --tailscale off --skip-channels \
+            --skip-skills --skip-search --skip-hooks --skip-ui --suppress-gateway-token-output \
+            >onboard.out 2>onboard.err; then
+            echo "::error::Headless onboarding failed"
+            grep -Ei 'unknown option|invalid option|not supported|unsupported|permissions' onboard.err \
+              | grep -Eiv 'token|secret|credential|password' | head -8 || true
+            exit 1
+          fi
+          echo "Non-interactive onboarding without provider credentials passed"
+          docker compose up --wait --wait-timeout 180 openclaw-gateway
+
+          for attempt in $(seq 1 15); do
+            if docker compose run --rm -T openclaw-cli dashboard --json \
+              >dashboard.json 2>dashboard.err; then break; fi
+            sleep 2
+          done
+          cat > verify-browser.cjs <<'JS'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const { chromium } = require("playwright");
+          async function main() {
+            const data = JSON.parse(fs.readFileSync("dashboard.json", "utf8"));
+            assert(data.ok === true && typeof data.browserUrl === "string", "Dashboard did not issue a browser URL");
+            const target = new URL(data.browserUrl);
+            assert(target.origin === "http://127.0.0.1:18789", "Unexpected dashboard origin");
+            const fragment = new URLSearchParams(target.hash.slice(1));
+            assert(fragment.has("bootstrapToken") && !fragment.has("token"), "Unexpected pairing URL shape");
+            assert(fragment.get("gatewayUrl") === "ws://127.0.0.1:18789", "Unexpected Gateway address");
+            const ttl = data.browserBootstrapExpiresAtMs - Date.now();
+            assert(ttl > 0 && ttl <= 600000, "Unexpected handoff expiry");
+            console.log("Dashboard JSON issued a loopback browser pairing URL valid for up to ten minutes");
+            const browser = await chromium.launch({headless: true});
+            try {
+              const page = await browser.newPage();
+              let timer;
+              const hello = new Promise((resolve, reject) => {
+                timer = setTimeout(() => reject(new Error("Control UI did not complete Gateway handshake")), 45000);
+                page.on("websocket", socket => {
+                  socket.on("framereceived", ({payload}) => {
+                    try {
+                      const message = JSON.parse(String(payload));
+                      if (message.type === "res" && message.ok === true && message.payload?.type === "hello-ok") {
+                        resolve();
+                      }
+                    } catch {}
+                  });
+                });
+              });
+              try {
+                await Promise.all([page.goto(data.browserUrl, {waitUntil: "domcontentloaded"}), hello]);
+              } finally {
+                clearTimeout(timer);
+              }
+              console.log("Fresh Chromium browser completed an authenticated Gateway handshake");
+            } finally {
+              await browser.close();
+            }
+          }
+          main().catch(error => {
+            console.error(error instanceof assert.AssertionError ? error.message : "Browser pairing or dashboard JSON validation failed");
+            process.exitCode = 1;
+          });
+          JS
+          node verify-browser.cjs
+
+          sentinel='
+            const assert = require("node:assert/strict");
+            const fs = require("node:fs");
+            const config = "/home/node/.openclaw/openclaw.json";
+            const workspace = "/home/node/.openclaw/workspace";
+            const authVolume = "/home/node/.config/openclaw";
+            const paths = [workspace, authVolume].map(dir => dir + "/compose-proof.txt");
+            const verify = process.argv[1] === "check";
+            if (!verify) {
+              fs.mkdirSync(workspace, {recursive: true});
+              for (const file of paths) fs.writeFileSync(file, "isolated-compose-proof\n", {mode: 0o600});
+            } else {
+              for (const file of paths) assert.equal(fs.readFileSync(file, "utf8"), "isolated-compose-proof\n");
+            }
+            const { createHash } = require("node:crypto");
+            console.log(createHash("sha256").update(fs.readFileSync(config)).digest("hex"));
+          '
+          before_id="$(docker compose ps -q openclaw-gateway)"
+          before_config="$(docker compose exec -T openclaw-gateway node -e "$sentinel" prepare)"
+          docker compose up --force-recreate --wait --wait-timeout 180 openclaw-gateway
+          after_id="$(docker compose ps -q openclaw-gateway)"
+          test "$before_id" != "$after_id"
+          after_config="$(docker compose exec -T openclaw-gateway node -e "$sentinel" check)"
+          test "$before_config" = "$after_config"
+          echo "Recreated Gateway preserved configuration and both volume sentinels"
