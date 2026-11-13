@@ -1,0 +1,151 @@
+name: Verify OpenClaw 197146 on Windows and WSL 2
+
+on:
+  push:
+    branches: [verify/pr-197146-windows-wsl-2270726]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-wsl-compose:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Start Docker in Ubuntu 24.04 on WSL 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          wsl.exe --set-default-version 2
+          wsl.exe --install --distribution Ubuntu-24.04 --web-download --no-launch
+          $kernel = (wsl.exe -d Ubuntu-24.04 -u root --exec uname -r) -join ''
+          if ($kernel -notmatch 'WSL2') { throw 'Expected WSL 2' }
+          Write-Output "WSL 2 kernel: $kernel"
+          wsl.exe -d Ubuntu-24.04 -u root --exec bash -ec 'apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io docker-compose-v2 && service docker start'
+          wsl.exe -d Ubuntu-24.04 -u root --exec docker compose version
+          wsl.exe -d Ubuntu-24.04 -u root --exec docker info --format '{{.OSType}}'
+      - name: Install Windows Chromium test driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --disable-pip-version-check playwright==1.52.0
+          python -m playwright install chromium --only-shell
+      - name: Verify Compose, Windows clipboard, and browser pairing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pr = '227072618087ed428136b401cc6a1fa1c6c2de9d'
+          $work = Join-Path $env:RUNNER_TEMP 'openclaw-197146-compose'
+          New-Item -ItemType Directory -Path $work | Out-Null
+          Set-Location $work
+          $guestWork = ((wsl.exe -d Ubuntu-24.04 -u root --exec wslpath -a $work) -join '').Trim()
+          function docker {
+            wsl.exe -d Ubuntu-24.04 -u root --cd $guestWork --exec docker @args
+          }
+          Remove-Item Env:OPENCLAW_GATEWAY_TOKEN, Env:OPENCLAW_GATEWAY_PASSWORD, Env:OPENCLAW_IMAGE -ErrorAction SilentlyContinue
+          Write-Output "PowerShell $($PSVersionTable.PSVersion)"
+          $guide = (Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/wyf027/openclaw/$pr/docs/install/docker.md").Content
+          $section = [regex]::Match($guide, '(?ms)^### Use a pre-built image without cloning\s*\n(.*?)(?=^### )')
+          $override = [regex]::Match($section.Groups[1].Value, '(?ms)^```yaml\s*\n(.*?)^```')
+          $pairCommand = '(docker compose exec -T openclaw-gateway node openclaw.mjs dashboard --json | ConvertFrom-Json).browserUrl | Set-Clipboard'
+          if (!$override.Success -or !$section.Value.Contains($pairCommand)) {
+            throw 'Expected Compose override and clipboard command are missing at the PR head'
+          }
+          Set-Content -Path compose.override.yaml -Value $override.Groups[1].Value -Encoding ascii
+          $Version = "2026.11.2"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/openclaw/openclaw/v$Version/docker-compose.yml" -OutFile compose.yaml
+          "OPENCLAW_IMAGE=ghcr.io/openclaw/openclaw:$Version" | Set-Content -Encoding ascii .env
+          $config = (docker compose config --format json | Out-String | ConvertFrom-Json).services.'openclaw-gateway'
+          if ($config.build -or $config.ports.Count -ne 1 -or $config.ports[0].host_ip -ne '127.0.0.1' -or $config.ports[0].published -ne '18789') {
+            throw 'Expected published image and loopback-only port'
+          }
+          try {
+            docker compose pull
+            $imageId = docker run --rm --network none "ghcr.io/openclaw/openclaw:$Version" node openclaw.mjs --version
+            if ($imageId -notmatch '2026\.11\.2 \(b556fdf\)') { throw 'Unexpected OpenClaw release' }
+            Write-Output "Official image: $imageId"
+            docker compose run --rm -T --no-deps --entrypoint node openclaw-gateway openclaw.mjs onboard --mode local --flow advanced --gateway-bind lan --gateway-auth token --skip-health --no-install-daemon --non-interactive --accept-risk --auth-choice skip --gateway-port 18789 --tailscale off --skip-channels --skip-skills --skip-search --skip-hooks --skip-ui --suppress-gateway-token-output > onboard.out 2> onboard.err
+            Write-Output 'Non-interactive onboarding passed without provider credentials'
+            docker compose up --wait --wait-timeout 180 openclaw-gateway
+            $ready = $false
+            for ($i = 0; $i -lt 25; $i++) {
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:18789/' -TimeoutSec 3
+                if ($response.StatusCode -eq 200 -and $response.Headers.'Content-Type' -like 'text/html*') {
+                  $ready = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+            }
+            if (!$ready) { throw 'The Windows host could not load the WSL Gateway' }
+            Write-Output 'Windows PowerShell received HTTP 200 from the WSL Gateway'
+
+            Set-Clipboard -Value 'openclaw-clipboard-control'
+            & ([scriptblock]::Create($pairCommand))
+            $env:PAIRING_URL = (Get-Clipboard -Raw).Trim()
+            if ($env:PAIRING_URL -notmatch '^http://127\.0\.0\.1:18789/' -or $env:PAIRING_URL -notmatch 'bootstrapToken=') {
+              throw 'Clipboard did not contain a Gateway pairing URL'
+            }
+            Write-Output 'The documented pipeline copied a loopback pairing URL to the Windows clipboard'
+            @'
+          import json
+          import os
+          from playwright.sync_api import sync_playwright
+
+          def valid_frame(payload):
+              try:
+                  message = json.loads(payload)
+                  return (
+                      message.get("type") == "res"
+                      and message.get("ok") is True
+                      and (message.get("payload") or {}).get("type") == "hello-ok"
+                  )
+              except (TypeError, ValueError):
+                  return False
+
+          try:
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch(headless=True)
+                  page = browser.new_page()
+                  paired = []
+                  page.on("websocket", lambda socket: socket.on(
+                      "framereceived", lambda frame: paired.append(True) if valid_frame(frame) else None
+                  ))
+                  page.goto(os.environ["PAIRING_URL"], wait_until="domcontentloaded")
+                  for attempt in range(180):
+                      if paired:
+                          break
+                      page.wait_for_timeout(250)
+                  if not paired:
+                      raise RuntimeError("No successful handshake")
+                  browser.close()
+          except Exception:
+              raise SystemExit("Windows Chromium did not complete the authenticated Gateway handshake")
+
+          print("Windows Chromium completed an authenticated Gateway handshake")
+          '@ | Set-Content -Path verify-browser.py -Encoding utf8
+            python verify-browser.py
+            Remove-Item Env:PAIRING_URL
+            Set-Clipboard -Value 'openclaw-clipboard-cleared'
+
+            $beforeContainer = docker compose ps -q openclaw-gateway
+            $beforeConfig = docker compose exec -T openclaw-gateway sha256sum /home/node/.openclaw/openclaw.json
+            docker compose exec -T openclaw-gateway sh -ec 'mkdir -p /home/node/.openclaw/workspace && touch /home/node/.openclaw/workspace/windows-proof /home/node/.config/openclaw/windows-proof'
+            docker compose up --force-recreate --wait --wait-timeout 180 openclaw-gateway
+            $afterContainer = docker compose ps -q openclaw-gateway
+            $afterConfig = docker compose exec -T openclaw-gateway sha256sum /home/node/.openclaw/openclaw.json
+            if ($beforeContainer -eq $afterContainer -or $beforeConfig -ne $afterConfig) {
+              throw 'Unexpected container identity or changed configuration'
+            }
+            docker compose exec -T openclaw-gateway sh -ec 'test -f /home/node/.openclaw/workspace/windows-proof && test -f /home/node/.config/openclaw/windows-proof'
+            Write-Output 'Recreating the Gateway preserved configuration and both volume sentinels'
+          } finally {
+            Remove-Item Env:PAIRING_URL -ErrorAction SilentlyContinue
+            try { Set-Clipboard -Value 'openclaw-clipboard-cleared' } catch {}
+            $PSNativeCommandUseErrorActionPreference = $false
+            docker compose down --volumes --remove-orphans
+          }
