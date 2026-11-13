@@ -75,11 +75,41 @@ jobs:
           echo "Non-interactive onboarding without provider credentials passed"
           docker compose up --wait --wait-timeout 180 openclaw-gateway
 
-          for attempt in $(seq 1 15); do
-            if docker compose run --rm -T openclaw-cli dashboard --json \
-              >dashboard.json 2>dashboard.err; then break; fi
+          classify_dashboard() {
+            node -e '
+              const fs = require("node:fs");
+              let data;
+              try { data = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+              catch { console.log("invalid JSON"); process.exit(2); }
+              if (data.ok === true && typeof data.browserUrl === "string") { console.log("pairing URL issued"); process.exit(0); }
+              const reason = String(data.reason ?? data.error?.message ?? "");
+              if (/cannot verify Gateway ownership|namespace|unverifiable owner/i.test(reason)) console.log("ownership refusal");
+              else if (/asset.*prepar|HTTP 503|dashboard is unavailable/i.test(reason)) console.log("Control UI unavailable");
+              else if (/not.*reach|not listening|Gateway.*timeout/i.test(reason)) console.log("Gateway reachability failure");
+              else if (/state.*busy|state.*ownership|exclusive.*owner/i.test(reason)) console.log("state owner contention");
+              else console.log("other dashboard failure");
+              process.exit(1);
+            ' "$1"
+          }
+          # Confirm host HTTP first so the CLI comparisons use a ready Control UI.
+          for attempt in $(seq 1 20); do
+            if curl -fsSI http://127.0.0.1:18789/ >/dev/null 2>&1; then break; fi
             sleep 2
           done
+          curl -fsSI http://127.0.0.1:18789/ | grep -qi '^content-type: text/html'
+          oneoff_exit=0
+          docker compose run --rm -T openclaw-cli dashboard --json \
+            >oneoff.json 2>oneoff.err || oneoff_exit=$?
+          oneoff_class="$(classify_dashboard oneoff.json || true)"
+          echo "Separate Compose CLI container: exit $oneoff_exit, $oneoff_class"
+
+          inside_exit=0
+          docker compose exec -T openclaw-gateway node openclaw.mjs dashboard --json \
+            >dashboard.json 2>dashboard.err || inside_exit=$?
+          inside_class="$(classify_dashboard dashboard.json || true)"
+          echo "Gateway container: exit $inside_exit, $inside_class"
+          test "$inside_exit" = 0
+          test "$inside_class" = 'pairing URL issued'
           cat > verify-browser.cjs <<'JS'
           const assert = require("node:assert/strict");
           const fs = require("node:fs");
